@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 
 # シリアルポートの設定
-COM_PORT = 'COM10'
+COM_PORT = 'COM3'
 BAUD_RATE = 460800
 
 # JPEGデータの境界

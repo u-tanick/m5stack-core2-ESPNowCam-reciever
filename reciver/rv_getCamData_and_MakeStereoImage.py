@@ -24,22 +24,69 @@ def prepare_image(img):
     input_tensor = midas_transform(resized_img).unsqueeze(0)
     return input_tensor, resized_img
 
-# 視差画像の生成
+# 視差画像の生成（修正版）
 def create_disparity_images(img, depth_map):
-    h, w = depth_map.shape
-    left_image = img.copy()
-    right_image = img.copy()
+    h, w = img.shape[:2]
+    left_image = np.zeros_like(img)
+    right_image = np.zeros_like(img)
 
-    # 深度に基づいて左右にシフト
+    # 深度マップを正規化（0-1の範囲に）
+    depth_normalized = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+    
+    # 視差の最大値を設定（ピクセル単位）
+    max_disparity = 30
+    
+    # 視差画像生成（正しい方向でシフト）
     for y in range(h):
         for x in range(w):
-            shift = int(depth_map[y, x] * 10)  # 深度に基づくシフト量を計算
-            if x + shift < w:
-                right_image[y, x] = img[y, x + shift]
-            if x - shift >= 0:
-                left_image[y, x] = img[y, x - shift]
+            # 深度に基づいて視差を計算（近いほど大きな視差）
+            disparity = int((1.0 - depth_normalized[y, x]) * max_disparity)
+            
+            # 左画像：右方向にシフト（正の視差）
+            if x + disparity < w:
+                left_image[y, x] = img[y, x + disparity]
+            else:
+                left_image[y, x] = img[y, x]  # 境界の場合は元の値を使用
+            
+            # 右画像：左方向にシフト（負の視差）
+            if x - disparity >= 0:
+                right_image[y, x] = img[y, x - disparity]
+            else:
+                right_image[y, x] = img[y, x]  # 境界の場合は元の値を使用
 
     # 左右画像を結合 (SBS形式)
+    sbs_image = np.concatenate((left_image, right_image), axis=1)
+    return sbs_image
+
+# 代替案：cv2.flipを使用した反転修正
+def create_disparity_images_v2(img, depth_map):
+    h, w = img.shape[:2]
+    
+    # 深度マップを正規化
+    depth_normalized = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+    
+    # 視差マップを作成
+    max_disparity = 30
+    disparity_map = ((1.0 - depth_normalized) * max_disparity).astype(np.float32)
+    
+    # OpenCVのremapを使用してより効率的にシフト
+    map_x = np.zeros((h, w), dtype=np.float32)
+    map_y = np.zeros((h, w), dtype=np.float32)
+    
+    for y in range(h):
+        for x in range(w):
+            map_y[y, x] = y
+            map_x[y, x] = x
+    
+    # 左画像用のマッピング
+    map_x_left = map_x + disparity_map
+    left_image = cv2.remap(img, map_x_left, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    
+    # 右画像用のマッピング
+    map_x_right = map_x - disparity_map
+    right_image = cv2.remap(img, map_x_right, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    
+    # 左右画像を結合
     sbs_image = np.concatenate((left_image, right_image), axis=1)
     return sbs_image
 
@@ -47,19 +94,7 @@ def create_disparity_images(img, depth_map):
 def create_disparity_images_handler(img):
     # 入力画像を準備
     input_tensor, resized_img = prepare_image(img)
-
-    # # 深度推定
-    # with torch.no_grad():
-    #     depth_map = midas_model(input_tensor).squeeze().numpy()
-
-    # # 深度マップのサイズを元画像サイズにリサイズ
-    # depth_map_resized = cv2.resize(depth_map, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-    # # 視差画像生成
-    # disparity_image = create_disparity_images(img, depth_map_resized)
-
     disparity_image = None
-
     return disparity_image
 
 # ---------------------------------------------------------------------
@@ -129,7 +164,7 @@ def read_image_from_serial(ser):
         return None # Should not reach here
 
 # ---------------------------------------------------------------------
-# for mian
+# for main
 
 WINDOW_NAME = 'Disparity Camera Image'
 def main():
@@ -148,6 +183,9 @@ def main():
                     frame_count += 1
                     print(f"Successfully decoded frame {frame_count}. Image shape: {image.shape}")
 
+                    # 画像が左右反転している場合は、ここで修正
+                    image = cv2.flip(image, 1)  # 水平方向に反転
+
                     # 画像をリサイズ
                     input_tensor, resized_image = prepare_image(image)
 
@@ -158,8 +196,8 @@ def main():
                     # 深度マップのサイズを元画像サイズにリサイズ
                     depth_map_resized = cv2.resize(depth_map, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-                    # 視差画像生成
-                    disparity_image = create_disparity_images(image, depth_map_resized)
+                    # 視差画像生成（修正版を使用）
+                    disparity_image = create_disparity_images_v2(image, depth_map_resized)
 
                     # 5インチディスプレイの解像度に合わせてリサイズ
                     new_width = 1920
@@ -179,12 +217,7 @@ def main():
                         break
                 else:
                     print(f"cv2.imdecode returned None. Buffer length: {len(jpg_buffer)}. Saving to file for inspection.")
-                    # デバッグ用に先頭と末尾の数バイトを16進数で表示
-                    # print(f"Buffer head: {jpg_buffer.tobytes()[:20].hex()}")
-                    # print(f"Buffer tail: {jpg_buffer.tobytes()[-20:].hex()}")
-                    # with open(f"received_frame_error_{frame_count}.jpg", "wb") as f:
-                    #     f.write(jpg_buffer.tobytes())
-                    # frame_count += 1 # Increment even on error to save unique files
+
             except TimeoutError as e:
                 print(f"Timeout: {e}. Retrying...")
                 continue
